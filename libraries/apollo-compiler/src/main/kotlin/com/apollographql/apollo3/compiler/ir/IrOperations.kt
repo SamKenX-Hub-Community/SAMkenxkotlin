@@ -1,9 +1,5 @@
 package com.apollographql.apollo3.compiler.ir
 
-import com.apollographql.apollo3.api.BTerm
-import com.apollographql.apollo3.api.BVariable
-import com.apollographql.apollo3.api.BooleanExpression
-import com.apollographql.apollo3.api.containsPossibleTypes
 import com.apollographql.apollo3.ast.GQLFragmentDefinition
 import com.apollographql.apollo3.ast.GQLType
 import com.apollographql.apollo3.compiler.BooleanExpressionSerializer
@@ -156,6 +152,11 @@ internal data class IrFragmentDefinition(
     val dataProperty: IrProperty,
     val dataModelGroup: IrModelGroup,
     val source: String,
+    /**
+     * Whether the type condition is an interface or an enum.
+     * In that case, the data builder need to require __typename
+     */
+    val isTypeConditionAbstract: Boolean
 )
 
 @Serializable

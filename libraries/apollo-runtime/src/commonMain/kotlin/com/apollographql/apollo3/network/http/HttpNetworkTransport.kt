@@ -4,17 +4,21 @@ import com.apollographql.apollo3.api.ApolloRequest
 import com.apollographql.apollo3.api.ApolloResponse
 import com.apollographql.apollo3.api.CustomScalarAdapters
 import com.apollographql.apollo3.api.Operation
+import com.apollographql.apollo3.api.Subscription
 import com.apollographql.apollo3.api.http.DefaultHttpRequestComposer
 import com.apollographql.apollo3.api.http.HttpHeader
 import com.apollographql.apollo3.api.http.HttpRequest
 import com.apollographql.apollo3.api.http.HttpRequestComposer
 import com.apollographql.apollo3.api.http.HttpResponse
+import com.apollographql.apollo3.api.json.JsonReader
 import com.apollographql.apollo3.api.json.jsonReader
+import com.apollographql.apollo3.api.json.readAny
 import com.apollographql.apollo3.api.parseJsonResponse
 import com.apollographql.apollo3.api.withDeferredFragmentIds
 import com.apollographql.apollo3.exception.ApolloException
 import com.apollographql.apollo3.exception.ApolloHttpException
 import com.apollographql.apollo3.exception.ApolloParseException
+import com.apollographql.apollo3.exception.SubscriptionOperationException
 import com.apollographql.apollo3.internal.DeferredJsonMerger
 import com.apollographql.apollo3.internal.isMultipart
 import com.apollographql.apollo3.internal.multipartBodyFlow
@@ -23,8 +27,8 @@ import com.apollographql.apollo3.network.NetworkTransport
 import com.benasher44.uuid.Uuid
 import com.benasher44.uuid.uuid4
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.emitAll
-import kotlinx.coroutines.flow.filterNot
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -157,61 +161,73 @@ private constructor(
 
     return multipartBodyFlow(httpResponse)
         .mapNotNull { part ->
-          try {
-            val what = part.peek().jsonReader().use { reader ->
+          if (operation is Subscription) {
+            val kind = part.peek().jsonReader().use { reader ->
               // detect what kind of payload we have
               reader.beginObject()
               if (!reader.hasNext()) {
-                return@use EMPTY
+                return@use Kind.EMPTY
               }
               val name = reader.nextName()
 
-              if (name == "payload") {
-                return@use PAYLOAD
-              } else {
-                return@use OTHER
+              return@use when (name) {
+                "payload" -> {
+                  if (reader.peek() == JsonReader.Token.NULL) {
+                    Kind.OTHER
+                  } else {
+                    Kind.PAYLOAD
+                  }
+                }
+                else -> Kind.OTHER
               }
             }
-
-            when (what)  {
-              EMPTY -> {
-                // nothing to do
+            when (kind) {
+              Kind.EMPTY -> {
+                // nothing to do, maybe it's a ping
                 null
               }
-              PAYLOAD -> {
+
+              Kind.PAYLOAD -> {
+                // {"payload":{"data":{"aReviewWasAdded":{"id":11,"body":"A new review for Apollo Studio"}}}}
                 val reader = part.jsonReader()
                 // advance the reader
                 reader.beginObject()
                 reader.nextName()
+
+                // TODO: make parseJsonResponse not close the jsonReader
                 operation.parseJsonResponse(
                     jsonReader = reader,
                     customScalarAdapters = customScalarAdapters
-                ).newBuilder().build()
+                )
               }
-              else -> {
-                if (jsonMerger == null) {
-                  jsonMerger = DeferredJsonMerger()
-                }
-                val merged = jsonMerger!!.merge(part)
-                val deferredFragmentIds = jsonMerger!!.mergedFragmentIds
-                val isLast = !jsonMerger!!.hasNext
 
-                if (jsonMerger!!.isEmptyPayload) {
-                  null
-                } else {
-                  operation.parseJsonResponse(
-                      jsonReader = merged.jsonReader(),
-                      customScalarAdapters = customScalarAdapters.withDeferredFragmentIds(deferredFragmentIds)
-                  ).newBuilder().isLast(isLast).build()
-                }
+              Kind.OTHER -> {
+                // We assume if there's something that is not a payload, it is an error.
+                // {"payload":null,"errors":[{"message":"cannot read message from websocket","extensions":{"code":"WEBSOCKET_MESSAGE_ERROR"}}]}
+                val response = part.jsonReader().readAny()
+                errorResponse(operation, SubscriptionOperationException(operation.name(), response))
               }
             }
+          } else {
+            if (jsonMerger == null) {
+              jsonMerger = DeferredJsonMerger()
+            }
+            val merged = jsonMerger!!.merge(part)
+            val deferredFragmentIds = jsonMerger!!.mergedFragmentIds
+            val isLast = !jsonMerger!!.hasNext
 
-          } catch (e: Exception) {
-            errorResponse(operation, e)
+            if (jsonMerger!!.isEmptyPayload) {
+              null
+            } else {
+              operation.parseJsonResponse(
+                  jsonReader = merged.jsonReader(),
+                  customScalarAdapters = customScalarAdapters.withDeferredFragmentIds(deferredFragmentIds)
+              ).newBuilder().isLast(isLast).build()
+            }
           }
+        }.catch {
+          emit(errorResponse(operation, it))
         }
-
   }
 
   private fun <D : Operation.Data> ApolloResponse<D>.withHttpInfo(
@@ -257,6 +273,7 @@ private constructor(
         .httpEngine(engine)
         .interceptors(interceptors)
         .httpRequestComposer(httpRequestComposer)
+        .exposeErrorBody(exposeErrorBody)
   }
 
   /**
@@ -268,6 +285,7 @@ private constructor(
     private var engine: HttpEngine? = null
     private val interceptors: MutableList<HttpInterceptor> = mutableListOf()
     private var exposeErrorBody: Boolean = false
+    private val headers: MutableList<HttpHeader> = mutableListOf()
 
     fun httpRequestComposer(httpRequestComposer: HttpRequestComposer) = apply {
       this.httpRequestComposer = httpRequestComposer
@@ -289,8 +307,17 @@ private constructor(
       this.exposeErrorBody = exposeErrorBody
     }
 
+    fun addHttpHeader(name: String, value: String) = apply {
+      headers.add(HttpHeader(name, value))
+    }
+
     fun httpHeaders(headers: List<HttpHeader>) = apply {
-      interceptors.add(HeadersInterceptor(headers))
+      // In case this builder comes from newBuilder(), remove any existing interceptor
+      interceptors.removeAll {
+        it is TransportHeadersInterceptor
+      }
+      this.headers.clear()
+      this.headers.addAll(headers)
     }
 
     fun httpEngine(httpEngine: HttpEngine) = apply {
@@ -313,6 +340,11 @@ private constructor(
       val composer = httpRequestComposer
           ?: serverUrl?.let { DefaultHttpRequestComposer(it) }
           ?: error("No HttpRequestComposer found. Use 'httpRequestComposer' or 'serverUrl'")
+
+      if (headers.isNotEmpty()) {
+        interceptors.add(TransportHeadersInterceptor(headers))
+      }
+
       return HttpNetworkTransport(
           httpRequestComposer = composer,
           engine = engine ?: DefaultHttpEngine(),
@@ -322,9 +354,21 @@ private constructor(
     }
   }
 
+  private class TransportHeadersInterceptor(private val headers: List<HttpHeader>) : HttpInterceptor {
+    override suspend fun intercept(
+        request: HttpRequest,
+        chain: HttpInterceptorChain,
+    ): HttpResponse {
+      return chain.proceed(request.newBuilder().addHeaders(headers).build())
+    }
+  }
+
+
   private companion object {
-    private const val EMPTY = 0
-    private const val PAYLOAD = 1
-    private const val OTHER = 2
+    enum class Kind {
+      EMPTY,
+      PAYLOAD,
+      OTHER,
+    }
   }
 }

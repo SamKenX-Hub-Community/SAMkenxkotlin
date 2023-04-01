@@ -1,13 +1,13 @@
 package com.apollographql.apollo3.compiler.codegen.kotlin.selections
 
-import com.apollographql.apollo3.api.BVariable
-import com.apollographql.apollo3.api.BooleanExpression
 import com.apollographql.apollo3.compiler.applyIf
 import com.apollographql.apollo3.compiler.codegen.Identifier.root
 import com.apollographql.apollo3.compiler.codegen.kotlin.KotlinContext
 import com.apollographql.apollo3.compiler.codegen.kotlin.KotlinSymbols
 import com.apollographql.apollo3.compiler.codegen.kotlin.helpers.codeBlock
 import com.apollographql.apollo3.compiler.codegen.kotlin.helpers.toListInitializerCodeblock
+import com.apollographql.apollo3.compiler.ir.BVariable
+import com.apollographql.apollo3.compiler.ir.BooleanExpression
 import com.apollographql.apollo3.compiler.ir.IrArgument
 import com.apollographql.apollo3.compiler.ir.IrField
 import com.apollographql.apollo3.compiler.ir.IrFragment
@@ -119,11 +119,7 @@ internal class CompiledSelectionsBuilder(
 
     check(expression is BooleanExpression.Element)
 
-    return if (expression.value.defaultValue != null) {
-      CodeBlock.of("%T(%S,·%L,·%L)", KotlinSymbols.CompiledCondition, expression.value.name, inverted.toString(), expression.value.defaultValue.toString())
-    } else {
-      CodeBlock.of("%T(%S,·%L)", KotlinSymbols.CompiledCondition, expression.value.name, inverted.toString())
-    }
+    return CodeBlock.of("%T(%S,·%L)", KotlinSymbols.CompiledCondition, expression.value.name, inverted.toString())
   }
 
   private fun IrArgument.codeBlock(): CodeBlock {

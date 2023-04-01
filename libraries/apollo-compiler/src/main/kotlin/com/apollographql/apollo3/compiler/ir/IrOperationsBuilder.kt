@@ -1,12 +1,5 @@
 package com.apollographql.apollo3.compiler.ir
 
-import com.apollographql.apollo3.api.BLabel
-import com.apollographql.apollo3.api.BTerm
-import com.apollographql.apollo3.api.BVariable
-import com.apollographql.apollo3.api.BooleanExpression
-import com.apollographql.apollo3.api.and
-import com.apollographql.apollo3.api.not
-import com.apollographql.apollo3.api.or
 import com.apollographql.apollo3.ast.GQLBooleanValue
 import com.apollographql.apollo3.ast.GQLDirective
 import com.apollographql.apollo3.ast.GQLEnumTypeDefinition
@@ -298,7 +291,7 @@ internal class IrOperationsBuilder(
         operationType = operationType.toIrOperationType(schema.rootTypeNameFor(operationType)),
         typeCondition = typeDefinition.name,
         variables = variableDefinitions.map { it.toIr() },
-        selectionSets = SelectionSetsBuilder(schema, allFragmentDefinitions).build(selectionSet.selections, typeDefinition.name, variableDefinitions),
+        selectionSets = SelectionSetsBuilder(schema, allFragmentDefinitions).build(selectionSet.selections, typeDefinition.name),
         sourceWithFragments = sourceWithFragments,
         filePath = sourceLocation.filePath!!,
         dataProperty = dataProperty,
@@ -335,11 +328,12 @@ internal class IrOperationsBuilder(
         filePath = sourceLocation.filePath!!,
         typeCondition = typeDefinition.name,
         variables = inferredVariables.map { it.toIr() },
-        selectionSets = SelectionSetsBuilder(schema, allFragmentDefinitions).build(selectionSet.selections, typeCondition.name, emptyList()),
+        selectionSets = SelectionSetsBuilder(schema, allFragmentDefinitions).build(selectionSet.selections, typeCondition.name),
         interfaceModelGroup = interfaceModelGroup,
         dataProperty = dataProperty,
         dataModelGroup = dataModelGroup,
-        source = formatToString()
+        source = formatToString(),
+        isTypeConditionAbstract = typeDefinition !is GQLObjectTypeDefinition
     )
   }
 
@@ -442,17 +436,10 @@ internal class IrOperationsBuilder(
       }
       val forceNonNull = gqlField.directives.findNonnull(schema) || parentTypeDefinition.isFieldNonNull(gqlField.name, schema)
 
-      /**
-       * It's ok to always pass the empty list for variableDefinitions because the parsers do not care about @include and @skip
-       * All they care about is that the model types match what is sent by the server
-       */
-      val variableDefinitions: List<GQLVariableDefinition> = emptyList()
-      val condition = gqlField.directives.toIncludeBooleanExpression(variableDefinitions)
-
       CollectedField(
           name = gqlField.name,
           alias = gqlField.alias,
-          condition = condition,
+          condition = gqlField.directives.toIncludeBooleanExpression(),
           selections = gqlField.selectionSet?.selections ?: emptyList(),
           type = fieldDefinition.type,
           description = fieldDefinition.description,
@@ -671,9 +658,9 @@ internal fun GQLValue.toIrValue(): IrValue {
  * - (!)Variable
  * - (!)Variable & (!)Variable
  */
-internal fun List<GQLDirective>.toIncludeBooleanExpression(variableDefinitions: List<GQLVariableDefinition>): BooleanExpression<BVariable> {
+internal fun List<GQLDirective>.toIncludeBooleanExpression(): BooleanExpression<BVariable> {
   val conditions = mapNotNull {
-    it.toIncludeBooleanExpression(variableDefinitions)
+    it.toIncludeBooleanExpression()
   }
   return if (conditions.isEmpty()) {
     BooleanExpression.True
@@ -688,7 +675,7 @@ internal fun List<GQLDirective>.toIncludeBooleanExpression(variableDefinitions: 
   }
 }
 
-internal fun GQLDirective.toIncludeBooleanExpression(variableDefinitions: List<GQLVariableDefinition>): BooleanExpression<BVariable>? {
+internal fun GQLDirective.toIncludeBooleanExpression(): BooleanExpression<BVariable>? {
   if (setOf("skip", "include").contains(name).not()) {
     // not a condition directive
     return null
@@ -704,10 +691,7 @@ internal fun GQLDirective.toIncludeBooleanExpression(variableDefinitions: List<G
       if (value.value) BooleanExpression.True else BooleanExpression.False
     }
 
-    is GQLVariableValue -> {
-      val defaultValue = (variableDefinitions.firstOrNull { it.name == value.name }?.defaultValue as? GQLBooleanValue?)?.value
-      BooleanExpression.Element(BVariable(name = value.name, defaultValue = defaultValue))
-    }
+    is GQLVariableValue -> BooleanExpression.Element(BVariable(name = value.name))
     else -> throw IllegalStateException("Apollo: cannot pass ${value.toUtf8()} to '$name' directive")
   }.let {
     if (name == "skip") not(it) else it
@@ -729,7 +713,7 @@ internal fun List<GQLDirective>.toBooleanExpression(): BooleanExpression<BTerm> 
     }
     deferBooleanConditions.first()
   }
-  return toIncludeBooleanExpression(emptyList()).and(deferBooleanExpression).simplify()
+  return toIncludeBooleanExpression().and(deferBooleanExpression).simplify()
 }
 
 internal fun GQLDirective.toDeferBooleanExpression(): BooleanExpression<BTerm>? {
